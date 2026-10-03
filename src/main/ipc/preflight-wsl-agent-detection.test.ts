@@ -7,10 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const runWslProcessMock = vi.hoisted(() => vi.fn())
 vi.mock('../wsl/wsl-runner', () => ({ runWslProcess: runWslProcessMock }))
 
-import { detectWslCommandsOnPath } from './preflight-wsl-agent-detection'
+import {
+  detectWslCommandsOnPath,
+  detectWslOpenCodeCliGeneration
+} from './preflight-wsl-agent-detection'
 import { buildPosixCommandPathLookupScript } from '../../shared/posix-command-path-lookup'
 
-type RunWslProcessSpec = { distro?: string; loginPath: string; script: string }
+type RunWslProcessSpec = { distro?: string; loginPath: string; script: string; shell?: string }
 
 function lastSpec(): RunWslProcessSpec {
   const call = runWslProcessMock.mock.calls.at(-1)
@@ -161,6 +164,57 @@ it('still counts a genuine guest install', async () => {
   expect(await detectWslCommandsOnPath({ distro: 'Ubuntu' }, ['claude'])).toEqual(
     new Set(['claude'])
   )
+})
+
+describe('detectWslOpenCodeCliGeneration', () => {
+  beforeEach(() => {
+    runWslProcessMock.mockReset()
+  })
+
+  it('runs `opencode --version` in the guest and classifies v2', async () => {
+    runWslProcessMock.mockResolvedValue({
+      environmentResolved: true,
+      code: 0,
+      stdout: 'opencode v2.0.22\n',
+      stderr: '',
+      timedOut: false
+    })
+
+    await expect(detectWslOpenCodeCliGeneration({ distro: 'Ubuntu' })).resolves.toBe('v2')
+    const { script, shell } = lastSpec()
+    expect(script).toContain('opencode --version')
+    expect(shell).toBe('sh')
+  })
+
+  it('classifies a v1 guest', async () => {
+    runWslProcessMock.mockResolvedValue({
+      environmentResolved: true,
+      code: 0,
+      stdout: '1.18.34\n',
+      stderr: '',
+      timedOut: false
+    })
+
+    await expect(detectWslOpenCodeCliGeneration({ distro: 'Ubuntu' })).resolves.toBe('v1')
+  })
+
+  it('returns null, not an install verdict, when the probe fails', async () => {
+    runWslProcessMock.mockResolvedValue({
+      environmentResolved: true,
+      code: 127,
+      stdout: '',
+      stderr: 'not found',
+      timedOut: false
+    })
+
+    await expect(detectWslOpenCodeCliGeneration({ distro: 'Ubuntu' })).resolves.toBeNull()
+  })
+
+  it('returns null when wsl.exe cannot be started', async () => {
+    runWslProcessMock.mockRejectedValue(new Error('spawn wsl.exe ENOENT'))
+
+    await expect(detectWslOpenCodeCliGeneration({ distro: 'Ubuntu' })).resolves.toBeNull()
+  })
 })
 
 describe('the detection script itself, run by a real POSIX shell', () => {
