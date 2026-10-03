@@ -119,7 +119,7 @@ describe('opencode generation detection (WSL guest)', () => {
   function stubWslDetection(versionStdout: string): void {
     runWslProcessMock.mockImplementation(async ({ script }: { script: string }) => {
       const base = { environmentResolved: true, stderr: '', timedOut: false }
-      if (script.includes('opencode --version')) {
+      if (script.includes('"$resolved" --version')) {
         return { ...base, code: 0, stdout: versionStdout }
       }
       return { ...base, code: 0, stdout: detectionStdout }
