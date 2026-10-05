@@ -17,11 +17,9 @@ import { _resetKnownHostsCache } from '../gitlab/gl-utils'
 import { mergePersistedWindowsPathAsync } from '../pty/windows-environment-path'
 import { getActiveMultiplexer } from '../ssh/ssh-target-registry'
 import {
-  detectWslCommandsOnPath,
   detectWslOpenCodeCliGeneration,
   type WslPreflightTarget
 } from '../ipc/preflight-wsl-agent-detection'
-import { detectCommandsInInstallDirs } from '../ipc/local-agent-install-dir-detection'
 import {
   getPreflightWslTarget,
   type PreflightRuntimeContext
@@ -32,8 +30,8 @@ import { hydrateShellPathForAgentDetection } from '../ipc/agent-detection-shell-
 import {
   execCommandInWslOrThrow,
   execLocalPreflightCommandOrThrow,
+  findRunnableLocalCommand,
   isCommandAvailable,
-  isCommandOnPath,
   shellQuote
 } from '../ipc/preflight-command-exec'
 import {
@@ -46,9 +44,12 @@ import {
   resolveDetectedTuiAgentIds
 } from '../ipc/tui-agent-detection-commands'
 import { filterOpenCodeDetectedIds } from '../../shared/opencode-cli-detection'
+import type { OpenCodeCliGeneration } from '../../shared/opencode-cli-generation'
 import { detectLocalOpenCodeCliGeneration } from './opencode-generation-probe'
 import { invalidateWslGuestEnvironment } from '../wsl/wsl-guest-environment'
 import { prunePreflightWslCache } from '../preflight-wsl-cache'
+import { detectAgentCommandsOnHost } from './agent-command-detection'
+export { detectAgentCommandsOnHost } from './agent-command-detection'
 
 export type PreflightStatus = {
   git: { installed: boolean }
@@ -125,60 +126,54 @@ export function _resetPreflightCache(): void {
   preflightCacheEpoch += 1
 }
 
+function uniqueAgentIds(ids: Iterable<string>): string[] {
+  return [...new Set(ids)]
+}
+
+/** A CLI verdict and, on the local path, the exact copy that produced it. */
+type CommandRuntime = { installed: boolean; wslTarget?: WslPreflightTarget; binary?: string }
+
 async function detectCommandRuntime(
   command: string,
   context?: PreflightRuntimeContext
-): Promise<{ installed: boolean; wslTarget?: WslPreflightTarget }> {
+): Promise<CommandRuntime> {
   const wslTarget = getPreflightWslTarget(context)
   if (wslTarget) {
     return (await isCommandAvailable(command, wslTarget))
       ? { installed: true, wslTarget }
       : { installed: false }
   }
-  if (await isCommandAvailable(command)) {
-    return { installed: true }
-  }
-  return { installed: false }
+  // Pin auth to the copy that passed --version, so PATH cannot select the dead shim again.
+  const probe = await findRunnableLocalCommand(command)
+  return probe.status === 'available'
+    ? { installed: true, binary: probe.binary }
+    : { installed: false }
 }
 
 export async function detectInstalledAgents(context?: PreflightRuntimeContext): Promise<string[]> {
-  const wslTarget = getPreflightWslTarget(context)
-  if (wslTarget) {
-    const foundCommands = await detectWslCommandsOnPath(
-      wslTarget,
-      getTuiAgentDetectionProbeCommands(KNOWN_TUI_AGENT_DETECTION_COMMANDS, 'wsl')
-    )
-    const detected = resolveDetectedTuiAgentIds(
-      KNOWN_TUI_AGENT_DETECTION_COMMANDS,
-      foundCommands,
-      'wsl'
-    )
-    return filterOpenCodeDetectedIds(detected, () => detectWslOpenCodeCliGeneration(wslTarget))
-  }
-
-  const pathChecks = await Promise.all(
-    getTuiAgentDetectionProbeCommands(KNOWN_TUI_AGENT_DETECTION_COMMANDS, process.platform).map(
-      async (cmd) => ({ cmd, installedOnPath: await isCommandOnPath(cmd) })
-    )
-  )
-  const missedCommands = pathChecks.filter((check) => !check.installedOnPath).map(({ cmd }) => cmd)
-  // Why: PATH may still be unhydrated on a cold GUI launch; bulk resolution
-  // computes user install dirs once instead of blocking once per missed CLI.
-  const installDirCommands = detectCommandsInInstallDirs(missedCommands)
-  const foundCommands = new Set(
-    pathChecks
-      .filter(({ cmd, installedOnPath }) => installedOnPath || installDirCommands.has(cmd))
-      .map(({ cmd }) => cmd)
+  const commands = getTuiAgentDetectionProbeCommands(
+    KNOWN_TUI_AGENT_DETECTION_COMMANDS,
+    getPreflightWslTarget(context) ? 'wsl' : process.platform
   )
   const detected = resolveDetectedTuiAgentIds(
     KNOWN_TUI_AGENT_DETECTION_COMMANDS,
-    foundCommands,
-    process.platform
+    await detectAgentCommandsOnHost(commands, { context }),
+    getPreflightWslTarget(context) ? 'wsl' : process.platform
   )
-  // Why: the probe stays on the fs-only local path unless BOTH opencode ids
-  // resolve, so the #9297 zero-spawn guarantee is preserved for every other
-  // startup. See filterOpenCodeDetectedIds for the v2-package reason.
-  return filterOpenCodeDetectedIds(detected, detectLocalOpenCodeCliGeneration)
+  return filterOpenCodeDetectedIds(detected, openCodeGenerationProbe(context))
+}
+
+function openCodeGenerationProbe(
+  context?: PreflightRuntimeContext
+): () => Promise<OpenCodeCliGeneration | null> {
+  const wslTarget = getPreflightWslTarget(context)
+  // Why: a v2-only host resolves BOTH opencode ids (the v2 package ships both
+  // bins), so a v2-only machine would otherwise report the v1 entry (#24987).
+  // The WSL probe reuses the walk's mount-skipping lookup; the local probe
+  // classifies the binary detection resolved, install-dir fallback included.
+  return wslTarget
+    ? () => detectWslOpenCodeCliGeneration(wslTarget)
+    : detectLocalOpenCodeCliGeneration
 }
 
 export async function detectInstalledAgentsWithShellPathHydration(
@@ -253,14 +248,18 @@ export async function detectRemoteAgents(args: { connectionId: string }): Promis
   const result = (await mux.request('preflight.detectAgents', {
     commands: KNOWN_TUI_AGENT_DETECTION_COMMANDS
   })) as { agents: string[] }
-  return [...new Set(result.agents)]
+  return uniqueAgentIds(result.agents)
 }
 
-async function isGhAuthenticated(wslTarget?: WslPreflightTarget): Promise<boolean> {
+// Why the probe object rather than the bare command name: on the local path
+// `binary` is the copy that just passed `--version`, which on a shim-shadowed
+// host is not what PATH would resolve (#22975). WSL has no `binary` — the guest
+// resolves the name inside the distro, where Orca's PATH ordering cannot apply.
+async function isGhAuthenticated(probe: CommandRuntime): Promise<boolean> {
   try {
-    await (wslTarget
-      ? execCommandInWslOrThrow(wslTarget, `${shellQuote('gh')} auth status`)
-      : execLocalPreflightCommandOrThrow('gh', ['auth', 'status']))
+    await (probe.wslTarget
+      ? execCommandInWslOrThrow(probe.wslTarget, `${shellQuote('gh')} auth status`)
+      : execLocalPreflightCommandOrThrow(probe.binary ?? 'gh', ['auth', 'status']))
     // Why: for plain-text `gh auth status`, exit 0 means gh did not detect any
     // authentication issues for the checked hosts/accounts.
     return true
@@ -277,11 +276,11 @@ async function isGhAuthenticated(wslTarget?: WslPreflightTarget): Promise<boolea
 
 // Why: parallel to isGhAuthenticated for the glab CLI. glab writes auth
 // status to stderr in some versions and stdout in others; check both.
-async function isGlabAuthenticated(wslTarget?: WslPreflightTarget): Promise<boolean> {
+async function isGlabAuthenticated(probe: CommandRuntime): Promise<boolean> {
   try {
-    await (wslTarget
-      ? execCommandInWslOrThrow(wslTarget, `${shellQuote('glab')} auth status`)
-      : execLocalPreflightCommandOrThrow('glab', ['auth', 'status']))
+    await (probe.wslTarget
+      ? execCommandInWslOrThrow(probe.wslTarget, `${shellQuote('glab')} auth status`)
+      : execLocalPreflightCommandOrThrow(probe.binary ?? 'glab', ['auth', 'status']))
     return true
   } catch (error) {
     const stdout = (error as { stdout?: string }).stdout ?? ''
@@ -383,8 +382,8 @@ async function executePreflightCheck(
   ])
 
   const [ghAuthenticated, glabAuthenticated, bitbucket, azureDevOps, gitea] = await Promise.all([
-    ghProbe.installed ? isGhAuthenticated(ghProbe.wslTarget) : Promise.resolve(false),
-    glabProbe.installed ? isGlabAuthenticated(glabProbe.wslTarget) : Promise.resolve(false),
+    ghProbe.installed ? isGhAuthenticated(ghProbe) : Promise.resolve(false),
+    glabProbe.installed ? isGlabAuthenticated(glabProbe) : Promise.resolve(false),
     getBitbucketAuthStatus(),
     getAzureDevOpsAuthStatus(),
     getGiteaAuthStatus()
